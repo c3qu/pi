@@ -139,6 +139,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private previousHeight = 0;
 	private cursorRow = 0;
 	private hardwareCursorRow = 0;
+	/** Last column explicitly positioned via CHA; undefined when the paint moved the cursor. */
+	private positionedCursorCol: number | undefined = undefined;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
 
@@ -161,6 +163,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousHeight = state.previousHeight;
 		this.cursorRow = state.cursorRow;
 		this.hardwareCursorRow = state.hardwareCursorRow;
+		// The captured column refers to the other renderer instance's paint state.
+		this.positionedCursorCol = undefined;
 		this.maxLinesRendered = state.maxLinesRendered;
 		this.previousViewportTop = state.previousViewportTop;
 	}
@@ -171,6 +175,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousHeight = -1;
 		this.cursorRow = 0;
 		this.hardwareCursorRow = 0;
+		this.positionedCursorCol = undefined;
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
 	}
@@ -310,11 +315,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				}
 				output.append(line);
 			}
+			this.cursorRow = Math.max(0, newLines.length - 1);
+			this.hardwareCursorRow = this.cursorRow;
+			// Painting moved the cursor, so the last explicitly positioned column is stale.
+			this.positionedCursorCol = undefined;
+			this.appendCursorPosition(output, cursorPos, newLines.length);
 			output.append(ENABLE_AUTOWRAP);
 			output.append("\x1b[?2026l"); // End synchronized output
 			output.flush();
-			this.cursorRow = Math.max(0, newLines.length - 1);
-			this.hardwareCursorRow = this.cursorRow;
 			// Reset max lines when clearing, otherwise track growth
 			if (clear) {
 				this.maxLinesRendered = newLines.length;
@@ -323,7 +331,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
-			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
@@ -402,7 +409,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
-			this.positionHardwareCursor(cursorPos, newLines.length);
+			// Nothing was painted, so the cursor sits exactly where the last frame
+			// positioned it. Skip the frame entirely when the target is unchanged;
+			// re-emitting CHA on every background render re-anchors terminal-owned
+			// IME preedit overlays and makes composed text flicker.
+			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+			this.appendCursorPosition(output, cursorPos, newLines.length);
+			output.flush();
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
 			return;
@@ -445,13 +458,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (moveBack > 0) {
 					output.append(`\x1b[${moveBack}A`);
 				}
+				this.cursorRow = targetRow;
+				this.hardwareCursorRow = targetRow;
+				this.positionedCursorCol = undefined;
+				this.appendCursorPosition(output, cursorPos, newLines.length);
 				output.append(ENABLE_AUTOWRAP);
 				output.append("\x1b[?2026l");
 				output.flush();
-				this.cursorRow = targetRow;
-				this.hardwareCursorRow = targetRow;
 			}
-			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
@@ -579,6 +593,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			output.append(`\x1b[${extraLines}A`);
 		}
 
+		// Track cursor position for next render
+		// cursorRow tracks end of content (for viewport calculation)
+		// hardwareCursorRow tracks actual terminal cursor position (for movement)
+		this.cursorRow = Math.max(0, newLines.length - 1);
+		this.hardwareCursorRow = finalCursorRow;
+		// Track terminal's working area (grows but doesn't shrink unless cleared)
+		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
+
+		// Painting moved the cursor, so the last explicitly positioned column is stale.
+		this.positionedCursorCol = undefined;
+
+		// Position hardware cursor for IME inside the synchronized frame so the
+		// terminal never observes an intermediate cursor position from this frame.
+		this.appendCursorPosition(output, cursorPos, newLines.length);
+
 		output.append(ENABLE_AUTOWRAP);
 		output.append("\x1b[?2026l"); // End synchronized output
 
@@ -613,18 +643,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		output.flush();
 
-		// Track cursor position for next render
-		// cursorRow tracks end of content (for viewport calculation)
-		// hardwareCursorRow tracks actual terminal cursor position (for movement)
-		this.cursorRow = Math.max(0, newLines.length - 1);
-		this.hardwareCursorRow = finalCursorRow;
-		// Track terminal's working area (grows but doesn't shrink unless cleared)
-		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
-		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
-
-		// Position hardware cursor for IME
-		this.positionHardwareCursor(cursorPos, newLines.length);
-
 		this.previousLines = newLines;
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
@@ -632,13 +650,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	/**
-	 * Position the hardware cursor for IME candidate window.
+	 * Append hardware cursor positioning for the IME candidate window to the
+	 * frame buffer. Keeping positioning in the same terminal write as the paint
+	 * makes a render frame atomic for the terminal: intermediate cursor
+	 * positions inside the frame are never rendered, so terminal-owned IME
+	 * preedit overlays anchored at the cursor are not torn down and redrawn
+	 * (visible as flicker) while background renders stream in.
 	 * @param cursorPos The cursor position extracted from rendered output, or null
 	 * @param totalLines Total number of rendered lines
 	 */
-	private positionHardwareCursor(cursorPos: { row: number; col: number } | null, totalLines: number): void {
+	private appendCursorPosition(
+		output: BoundedTerminalWriter,
+		cursorPos: { row: number; col: number } | null,
+		totalLines: number,
+	): void {
 		if (!cursorPos || totalLines <= 0) {
-			this.terminal.hideCursor();
+			output.append("\x1b[?25l");
 			return;
 		}
 
@@ -646,26 +673,27 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const targetRow = Math.max(0, Math.min(cursorPos.row, totalLines - 1));
 		const targetCol = Math.max(0, cursorPos.col);
 
-		// Move cursor from current position to target
+		// Move cursor from current position to target. Skip the movement entirely
+		// when the cursor already sits at the target cell: re-emitting CHA on
+		// every background render re-anchors terminal-owned IME preedit overlays
+		// even though the position does not change.
 		const rowDelta = targetRow - this.hardwareCursorRow;
-		let buffer = "";
-		if (rowDelta > 0) {
-			buffer += `\x1b[${rowDelta}B`; // Move down
-		} else if (rowDelta < 0) {
-			buffer += `\x1b[${-rowDelta}A`; // Move up
-		}
-		// Move to absolute column (1-indexed)
-		buffer += `\x1b[${targetCol + 1}G`;
-
-		if (buffer) {
-			this.terminal.write(buffer);
+		if (rowDelta !== 0 || this.positionedCursorCol !== targetCol) {
+			if (rowDelta > 0) {
+				output.append(`\x1b[${rowDelta}B`); // Move down
+			} else if (rowDelta < 0) {
+				output.append(`\x1b[${-rowDelta}A`); // Move up
+			}
+			// Move to absolute column (1-indexed)
+			output.append(`\x1b[${targetCol + 1}G`);
+			this.positionedCursorCol = targetCol;
 		}
 
 		this.hardwareCursorRow = targetRow;
 		if (this.getShowHardwareCursor()) {
-			this.terminal.showCursor();
+			output.append("\x1b[?25h");
 		} else {
-			this.terminal.hideCursor();
+			output.append("\x1b[?25l");
 		}
 	}
 }

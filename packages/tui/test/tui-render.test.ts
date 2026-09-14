@@ -13,7 +13,7 @@ import {
 	setCapabilities,
 	setCellDimensions,
 } from "../src/terminal-image.ts";
-import type { Component, TUI } from "../src/tui.ts";
+import { type Component, CURSOR_MARKER, type TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -179,7 +179,7 @@ describe("TUI bounded render output", () => {
 		);
 		assert.strictEqual(
 			terminal.writes.join(""),
-			`\x1b[?2026h\x1b[?7l${kittyLine}\r\n${kittyLine}\x1b[?7h\x1b[?2026l`,
+			`\x1b[?2026h\x1b[?7l${kittyLine}\r\n${kittyLine}\x1b[?25l\x1b[?7h\x1b[?2026l`,
 			"chunking must preserve the synchronized render output",
 		);
 	});
@@ -510,6 +510,17 @@ describe("TUI main-screen autowrap guard", () => {
 	// ConPTY wraps full-width lines eagerly, which drifts the renderer's cursor
 	// tracking and eventually paints the loader line at the top of the screen.
 	// Every render path must paint with autowrap disabled (see DISABLE_AUTOWRAP).
+	function assertAutowrapGuarded(output: string, label: string): void {
+		assert.ok(
+			output.includes("\x1b[?2026h\x1b[?7l"),
+			`${label} should disable autowrap after synchronized output begins`,
+		);
+		const enable = output.indexOf("\x1b[?7h");
+		assert.ok(enable !== -1, `${label} should re-enable autowrap`);
+		const end = output.indexOf("\x1b[?2026l", enable);
+		assert.ok(end !== -1, `${label} should end synchronized output after re-enabling autowrap`);
+	}
+
 	it("disables autowrap for the duration of full renders", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui: TUI = new TuiMainScreen(terminal);
@@ -519,15 +530,7 @@ describe("TUI main-screen autowrap guard", () => {
 		tui.start();
 		await terminal.waitForRender();
 
-		const output = terminal.getWrites();
-		assert.ok(
-			output.includes("\x1b[?2026h\x1b[?7l"),
-			"full render should disable autowrap after synchronized output begins",
-		);
-		assert.ok(
-			output.includes("\x1b[?7h\x1b[?2026l"),
-			"full render should re-enable autowrap before synchronized output ends",
-		);
+		assertAutowrapGuarded(terminal.getWrites(), "full render");
 		tui.stop();
 	});
 
@@ -547,14 +550,7 @@ describe("TUI main-screen autowrap guard", () => {
 
 		const output = terminal.getWrites();
 		assert.ok(!output.includes("\x1b[2J"), "the update should stay on the differential render path");
-		assert.ok(
-			output.includes("\x1b[?2026h\x1b[?7l"),
-			"differential render should disable autowrap after synchronized output begins",
-		);
-		assert.ok(
-			output.includes("\x1b[?7h\x1b[?2026l"),
-			"differential render should re-enable autowrap before synchronized output ends",
-		);
+		assertAutowrapGuarded(output, "differential render");
 		tui.stop();
 	});
 
@@ -575,15 +571,59 @@ describe("TUI main-screen autowrap guard", () => {
 
 		const output = terminal.getWrites();
 		assert.ok(!output.includes("\x1b[2J"), "deleted-line cleanup should stay on the incremental path");
-		assert.ok(
-			output.includes("\x1b[?2026h\x1b[?7l"),
-			"deleted-line cleanup should disable autowrap after synchronized output begins",
-		);
-		assert.ok(
-			output.includes("\x1b[?7h\x1b[?2026l"),
-			"deleted-line cleanup should re-enable autowrap before synchronized output ends",
-		);
+		assertAutowrapGuarded(output, "deleted-line cleanup");
 		tui.stop();
+	});
+});
+
+describe("TUI main-screen atomic render frames", () => {
+	// Windows Terminal renders between incoming write() calls. A frame split
+	// across writes exposes intermediate cursor positions (e.g. parked on the
+	// repainted loader rows), which re-anchors terminal-owned IME preedit
+	// overlays and makes composed text flicker while the agent is working.
+	// Cursor positioning must therefore ship in the same write as the paint.
+	class CursorMarkerComponent implements Component {
+		focused = false;
+		render(width: number): string[] {
+			return [`${"x".repeat(Math.min(5, width - 1))}${CURSOR_MARKER}`];
+		}
+		invalidate(): void {}
+	}
+
+	it("emits a differential render frame as a single terminal write", async () => {
+		const terminal = new BoundedWriteTerminal();
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+		component.lines = ["before"];
+		tui.renderNow();
+
+		const framesBefore = terminal.writes.length;
+		component.lines = ["before", "changed"];
+		tui.renderNow();
+
+		assert.strictEqual(terminal.writes.length, framesBefore + 1, "each render frame should be one write");
+		const frame = terminal.writes[terminal.writes.length - 1];
+		assert.ok(frame.includes("\x1b[2K"), "frame should paint the changed line");
+		assert.ok(frame.includes("\x1b[?25l"), "frame should include cursor visibility handling");
+		assert.ok(frame.endsWith("\x1b[?2026l"), "frame should end synchronized output");
+	});
+
+	it("skips redundant cursor positioning when the position is unchanged", async () => {
+		const terminal = new BoundedWriteTerminal();
+		const tui = new TuiMainScreen(terminal);
+		const component = new CursorMarkerComponent();
+		tui.addChild(component);
+		tui.renderNow();
+
+		const cha = /\x1b\[\d+G/;
+		assert.match(terminal.writes[0], cha, "first frame should position the hardware cursor");
+		const writesAfterFirstFrame = terminal.writes.length;
+
+		// Nothing changed: the frame must not re-emit cursor positioning.
+		tui.renderNow();
+		assert.strictEqual(terminal.writes.length, writesAfterFirstFrame + 1);
+		assert.doesNotMatch(terminal.writes[terminal.writes.length - 1], cha);
 	});
 });
 
